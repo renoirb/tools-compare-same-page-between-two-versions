@@ -1,5 +1,6 @@
 import { chromium } from 'npm:playwright@1.35.0'
 import { Image } from 'https://deno.land/x/imagescript@1.2.15/mod.ts'
+import { exists } from 'https://deno.land/std/fs/exists.ts'
 
 const BASE_URL_LEFT = 'https://renoirboulanger.com'
 const BASE_URL_RIGHT = 'https://renoirboulanger-com.pages.dev'
@@ -7,23 +8,39 @@ const INPUT_FILE = 'input.csv'
 const OUTPUT_FILE = 'output.csv'
 const OUTPUT_DIR = 'output'
 
-async function takeScreenshot(url: string): Promise<Uint8Array> {
+async function takeScreenshot(
+  url: string,
+): Promise<{ image: Uint8Array; statusCode: number }> {
   const browser = await chromium.launch()
   const page = await browser.newPage()
 
-  await page.goto(url, { waitUntil: 'networkidle' })
+  let statusCode = 200
+  page.on('response', (response) => {
+    if (response.url() === url) {
+      statusCode = response.status()
+    }
+  })
 
-  // Scroll to bottom to ensure all lazy-loaded content is loaded
-  await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight))
+  try {
+    await page.goto(url, { waitUntil: 'networkidle' })
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight))
+    await page.waitForTimeout(2000)
 
-  // Wait a bit for any post-scroll loading
-  await page.waitForTimeout(2000)
+    const screenshot = (await page.screenshot({ fullPage: true })) as Uint8Array
+    return { image: screenshot, statusCode }
+  } catch (error) {
+    console.error(`Error capturing screenshot for ${url}: ${error.message}`)
+    return { image: await createErrorImage(statusCode), statusCode }
+  } finally {
+    await browser.close()
+  }
+}
 
-  const screenshot = await page.screenshot({ fullPage: true })
-
-  await browser.close()
-
-  return screenshot as Uint8Array
+async function createErrorImage(statusCode: number): Promise<Uint8Array> {
+  const image = new Image(400, 300)
+  image.fill(0xffffffff)
+  image.drawText(20, 20, `Error: ${statusCode}`, 0xff0000ff, 'sans-serif', 24)
+  return await image.encode()
 }
 
 async function combineImages(
@@ -38,11 +55,7 @@ async function combineImages(
   const maxHeight = Math.max(img1.height, img2.height)
 
   const combined = new Image(maxWidth * 2, maxHeight)
-
-  // Fill with white background
   combined.fill(0xffffffff)
-
-  // Paste images side by side
   combined.composite(img1, 0, 0)
   combined.composite(img2, maxWidth, 0)
 
@@ -64,56 +77,66 @@ function normalizeFileName(
 
 async function processUrl(
   lineNumber: number,
-  url: string,
+  leftUrl: string,
+  rightUrl: string,
   paddingLength: number,
-): Promise<string> {
-  const leftUrl = new URL(url, BASE_URL_LEFT).toString()
-  const rightUrl = new URL(url, BASE_URL_RIGHT).toString()
+): Promise<{ fileName: string; leftStatus: number; rightStatus: number }> {
+  const fullLeftUrl = new URL(leftUrl, BASE_URL_LEFT).toString()
+  const fullRightUrl = new URL(rightUrl, BASE_URL_RIGHT).toString()
 
   console.log(
-    `Processing ${lineNumber.toString().padStart(paddingLength, '0')}: ${url}`,
+    `Processing ${lineNumber
+      .toString()
+      .padStart(paddingLength, '0')}: ${leftUrl} | ${rightUrl}`,
   )
-  const [screenshot1, screenshot2] = await Promise.all([
-    takeScreenshot(leftUrl),
-    takeScreenshot(rightUrl),
+  const [leftResult, rightResult] = await Promise.all([
+    takeScreenshot(fullLeftUrl),
+    takeScreenshot(fullRightUrl),
   ])
 
-  const outputFileName = normalizeFileName(lineNumber, url, paddingLength)
+  const outputFileName = normalizeFileName(lineNumber, leftUrl, paddingLength)
   const outputPath = `${OUTPUT_DIR}/${outputFileName}`
-  await combineImages(screenshot1, screenshot2, outputPath)
+  await combineImages(leftResult.image, rightResult.image, outputPath)
 
-  return outputFileName
-}
-
-async function readInputFile(): Promise<string[]> {
-  const content = await Deno.readTextFile(INPUT_FILE)
-  return content.split('\n').filter((line) => line.trim() !== '')
+  return {
+    fileName: outputFileName,
+    leftStatus: leftResult.statusCode,
+    rightStatus: rightResult.statusCode,
+  }
 }
 
 function getPaddingLength(totalLines: number): number {
   return Math.max(3, Math.floor(Math.log10(totalLines)) + 1)
 }
 
-async function readOutputFile(): Promise<Set<string>> {
-  try {
-    const content = await Deno.readTextFile(OUTPUT_FILE)
-    const lines = content.split('\n').filter((line) => line.trim() !== '')
-    return new Set(lines.map((line) => line.split(',')[0].trim()))
-  } catch (error) {
-    if (error instanceof Deno.errors.NotFound) {
-      return new Set()
-    }
-    throw error
-  }
+async function readInputFile(): Promise<
+  Array<{ leftUrl: string; rightUrl: string }>
+> {
+  const content = await Deno.readTextFile(INPUT_FILE)
+  return content
+    .split('\n')
+    .filter((line) => line.trim() !== '')
+    .map((line) => {
+      const [leftUrl, rightUrl = leftUrl] = line
+        .split(',')
+        .map((url) => url.trim())
+      return { leftUrl, rightUrl }
+    })
 }
 
 async function appendToOutputFile(
-  url: string,
+  lineNumber: number,
+  leftUrl: string,
+  rightUrl: string,
   outputFileName: string,
+  leftStatus: number,
+  rightStatus: number,
 ): Promise<void> {
-  await Deno.writeTextFile(OUTPUT_FILE, `${url},${outputFileName}\n`, {
-    append: true,
-  })
+  await Deno.writeTextFile(
+    OUTPUT_FILE,
+    `${lineNumber},${leftUrl},${rightUrl},${outputFileName},${leftStatus},${rightStatus}\n`,
+    { append: true },
+  )
 }
 
 async function main() {
@@ -125,18 +148,34 @@ async function main() {
     }
   }
 
-  const urls = await readInputFile()
-  const paddingLength = getPaddingLength(urls.length)
-  const processedUrls = await readOutputFile()
+  const urlPairs = await readInputFile()
+  const paddingLength = getPaddingLength(urlPairs.length)
 
-  for (let i = 0; i < urls.length; i++) {
-    const url = urls[i]
-    if (!processedUrls.has(url)) {
-      const outputFileName = await processUrl(i + 1, url, paddingLength)
-      await appendToOutputFile(url, outputFileName)
-    } else {
-      console.log(`Skipping already processed URL: ${url}`)
+  for (let i = 0; i < urlPairs.length; i++) {
+    const lineNumber = i + 1
+    const { leftUrl, rightUrl } = urlPairs[i]
+    const outputFileName = normalizeFileName(lineNumber, leftUrl, paddingLength)
+    const outputPath = `${OUTPUT_DIR}/${outputFileName}`
+
+    if (await exists(outputPath)) {
+      console.log(`Skipping already processed URL: ${leftUrl}`)
+      continue
     }
+
+    const { fileName, leftStatus, rightStatus } = await processUrl(
+      lineNumber,
+      leftUrl,
+      rightUrl,
+      paddingLength,
+    )
+    await appendToOutputFile(
+      lineNumber,
+      leftUrl,
+      rightUrl,
+      fileName,
+      leftStatus,
+      rightStatus,
+    )
   }
 
   console.log('All URLs processed. Results saved in the output directory.')
