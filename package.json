@@ -1,7 +1,26 @@
 {
   "name": "deno-playwright-screenshot",
   "version": "1.0.0",
+  "private": true,
+  "homepage": "https://renoirboulanger.com",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/renoirb/site.git"
+  },
+  "license": "MIT",
+  "author": {
+    "name": "Renoir Boulanger",
+    "email": "contribs@renoirboulanger.com",
+    "url": "https://renoirboulanger.com"
+  },
   "dependencies": {
     "playwright": "^1.35.0"
+  },
+  "engines": {
+    "node": ">=14.0.0",
+    "npm": ">=8.0.0"
+  },
+  "script": {
+    "preinstall": "node -e \"if(process.env.npm_execpath.indexOf('npm') === -1) throw new Error('Dependencies must be installed with NPM: https://www.npmjs.com/')\""
   }
 }
